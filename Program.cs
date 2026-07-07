@@ -316,6 +316,7 @@ class TerminalProgress
 // ═════════════════════════════════════════════════════════════════════════════
 
 record CheckResult(string Name, bool Passed, string Note);
+record FirewallRule(string Name, string Action, string Profiles);
 
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -336,6 +337,7 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
         await RunAsync("Local Network Interfaces",   () => { CheckLocalInterfaces(); return Task.CompletedTask; });
         await RunAsync("DNS / Name Resolution",      CheckDnsAsync);
         await RunAsync("Proxy Configuration",        () => { CheckProxy();           return Task.CompletedTask; });
+        await RunAsync("Windows Firewall Rules",     CheckFirewallAsync);
         await RunAsync("TCP Connectivity",           CheckTcpAsync);
         await RunAsync("gRPC — no proxy",            () => CheckGrpcAsync(useProxy: false));
         await RunAsync("gRPC — system proxy",        () => CheckGrpcAsync(useProxy: true));
@@ -556,6 +558,196 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             log.Info("Tip: Run `netsh winhttp show proxy` to inspect the WinHTTP proxy separately.");
+        }
+    }
+
+    // ── Check: Windows Firewall Rules ─────────────────────────────────────────
+    //
+    // Reads the global firewall policy (on/off, default inbound/outbound actions)
+    // and queries rules specific to the target port:
+    //   • Inbound  — relevant if THIS machine is the AskUI Controller.
+    //   • Outbound — relevant if THIS machine is the CLIENT connecting remotely.
+    //
+    // Only meaningful on Windows; other platforms get manual-command hints.
+
+    private async Task CheckFirewallAsync()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            log.Info("Windows Firewall check skipped — not running on Windows.");
+            log.Info("macOS  : sudo pfctl -sr | grep {0}", port);
+            log.Info("Linux  : sudo iptables -L -n | grep {0}  or  sudo nft list ruleset", port);
+            return;
+        }
+
+        log.Info("Reading Windows Firewall profiles and port {0} rules...", port);
+
+        // Global policy: firewall state + default inbound/outbound actions
+        var profileOutput = await RunCommandAsync("netsh", "advfirewall show allprofiles");
+        log.Debug("netsh show allprofiles output:{0}{1}", Environment.NewLine, profileOutput);
+        ParseProfileOutput(profileOutput, out bool firewallEnabled, out bool outboundDefaultBlock);
+
+        if (!firewallEnabled)
+        {
+            log.Pass("Windows Firewall is OFF on all active profiles — no rules apply.");
+            Pass("Firewall:Outbound", "firewall off — no outbound blocks");
+            Pass("Firewall:Inbound",  "firewall off — no inbound blocks");
+            log.Info("Run this tool on the TARGET machine to check its firewall.");
+            return;
+        }
+
+        log.Info("Windows Firewall is ON.");
+        if (outboundDefaultBlock)
+            log.Warn("Default outbound policy: BLOCK (restrictive corporate configuration).");
+        else
+            log.Pass("Default outbound policy: ALLOW — outbound traffic permitted by default.");
+
+        // ── Inbound rules for TCP port <port> ─────────────────────────────────
+        var inboundRules = await QueryPortRulesAsync(direction: "Inbound", localPort: true);
+        var inAllows = inboundRules.Where(r => r.Action.Equals("Allow", StringComparison.OrdinalIgnoreCase)).ToList();
+        var inBlocks = inboundRules.Where(r => r.Action.Equals("Block", StringComparison.OrdinalIgnoreCase)).ToList();
+
+        if (inBlocks.Count > 0)
+        {
+            Fail("Firewall:Inbound", $"TCP port {port} is explicitly BLOCKED inbound on this machine");
+            foreach (var r in inBlocks)
+                log.Sub("[BLOCK] \"{0}\" (Profiles: {1})", r.Name, r.Profiles);
+            log.Sub("→ Remove the blocking rule, or add an allow rule (run as admin):");
+            log.Sub("    netsh advfirewall firewall add rule name=\"AskUI Controller\" dir=in action=allow protocol=TCP localport={0}", port);
+        }
+        else if (inAllows.Count > 0)
+        {
+            Pass("Firewall:Inbound", $"{inAllows.Count} inbound allow rule(s) for TCP port {port}");
+            foreach (var r in inAllows)
+                log.Sub("[ALLOW] \"{0}\" (Profiles: {1})", r.Name, r.Profiles);
+        }
+        else
+        {
+            log.Info("No inbound rules for TCP port {0} on this machine (default policy: Block).", port);
+            log.Sub("→ If THIS machine is the AskUI Controller, add an inbound allow rule (run as admin):");
+            log.Sub("    netsh advfirewall firewall add rule name=\"AskUI Controller\" dir=in action=allow protocol=TCP localport={0}", port);
+            log.Sub("  If this is the CLIENT machine, no inbound rule is needed here.");
+        }
+
+        // ── Outbound rules for TCP remoteport <port> ──────────────────────────
+        var outboundRules = await QueryPortRulesAsync(direction: "Outbound", localPort: false);
+        var outAllows = outboundRules.Where(r => r.Action.Equals("Allow", StringComparison.OrdinalIgnoreCase)).ToList();
+        var outBlocks = outboundRules.Where(r => r.Action.Equals("Block", StringComparison.OrdinalIgnoreCase)).ToList();
+
+        if (outBlocks.Count > 0)
+        {
+            Fail("Firewall:Outbound", $"outbound TCP to port {port} is explicitly BLOCKED on this machine");
+            foreach (var r in outBlocks)
+                log.Sub("[BLOCK] \"{0}\" (Profiles: {1})", r.Name, r.Profiles);
+            log.Sub("→ Remove the blocking rule, or add an allow rule (run as admin):");
+            log.Sub("    netsh advfirewall firewall add rule name=\"AskUI Client\" dir=out action=allow protocol=TCP remoteport={0}", port);
+        }
+        else if (outboundDefaultBlock && outAllows.Count == 0)
+        {
+            Fail("Firewall:Outbound", $"default outbound policy is BLOCK and no allow rule exists for TCP port {port}");
+            log.Sub("→ Add an outbound allow rule (run as admin):");
+            log.Sub("    netsh advfirewall firewall add rule name=\"AskUI Client\" dir=out action=allow protocol=TCP remoteport={0}", port);
+        }
+        else if (outAllows.Count > 0)
+        {
+            Pass("Firewall:Outbound", $"explicit outbound allow rule(s) for TCP port {port}");
+            foreach (var r in outAllows)
+                log.Sub("[ALLOW] \"{0}\" (Profiles: {1})", r.Name, r.Profiles);
+        }
+        else
+        {
+            Pass("Firewall:Outbound", $"default outbound policy is ALLOW — no blocks for TCP port {port}");
+        }
+
+        log.Info("This check reads THIS machine's firewall only.");
+        log.Info("→ Run the tool on the TARGET machine to check inbound rules there.");
+    }
+
+    // Queries enabled Windows Firewall rules matching a specific TCP port using
+    // PowerShell Get-NetFirewallPortFilter / Get-NetFirewallRule.
+    // direction: "Inbound" or "Outbound"
+    // localPort: true  → filters on LocalPort  (inbound rules, this machine is the server)
+    //            false → filters on RemotePort (outbound rules, this machine is the client)
+    private async Task<List<FirewallRule>> QueryPortRulesAsync(string direction, bool localPort)
+    {
+        var portProp = localPort ? "LocalPort" : "RemotePort";
+        var script   = $@"
+$ErrorActionPreference = 'SilentlyContinue'
+try {{
+    $pf = Get-NetFirewallPortFilter -Protocol TCP 2>$null |
+          Where-Object {{ $_.{portProp} -eq '{port}' }}
+    if ($pf) {{
+        foreach ($f in @($pf)) {{
+            Get-NetFirewallRule -AssociatedNetFirewallPortFilter $f 2>$null |
+                Where-Object {{ $_.Direction.ToString() -eq '{direction}' -and $_.Enabled.ToString() -eq 'True' }} |
+                ForEach-Object {{ ""$($_.DisplayName)|$($_.Action.ToString())|$($_.Profile.ToString())"" }}
+        }}
+    }}
+}} catch {{}}
+";
+        var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+        var output  = await RunCommandAsync("powershell", $"-NoProfile -NonInteractive -EncodedCommand {encoded}");
+        log.Debug("Firewall {0} query:{1}{2}", direction, Environment.NewLine, output);
+
+        var rules = new List<FirewallRule>();
+        foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var t = line.Trim();
+            if (string.IsNullOrEmpty(t)) continue;
+            var parts = t.Split('|');
+            if (parts.Length >= 2)
+                rules.Add(new FirewallRule(parts[0].Trim(), parts[1].Trim(), parts.Length >= 3 ? parts[2].Trim() : "Any"));
+        }
+        return rules;
+    }
+
+    // Parses `netsh advfirewall show allprofiles` output.
+    // firewallEnabled      = true if any profile has State = ON
+    // outboundDefaultBlock = true if any profile has "BlockOutbound" in its Firewall Policy line
+    private static void ParseProfileOutput(string output, out bool firewallEnabled, out bool outboundDefaultBlock)
+    {
+        firewallEnabled      = false;
+        outboundDefaultBlock = false;
+        foreach (var raw in output.Split('\n'))
+        {
+            var t = raw.Trim();
+            if (t.StartsWith("State", StringComparison.OrdinalIgnoreCase))
+            {
+                var tokens = t.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries);
+                if (tokens.Length >= 2 && tokens[^1].Equals("ON", StringComparison.OrdinalIgnoreCase))
+                    firewallEnabled = true;
+            }
+            else if (t.StartsWith("Firewall Policy", StringComparison.OrdinalIgnoreCase) &&
+                     t.Contains("BlockOutbound", StringComparison.OrdinalIgnoreCase))
+            {
+                outboundDefaultBlock = true;
+            }
+        }
+    }
+
+    // Runs an external command and returns its stdout. Never throws.
+    private static async Task<string> RunCommandAsync(string executable, string arguments)
+    {
+        try
+        {
+            using var proc = new Process
+            {
+                StartInfo = new ProcessStartInfo(executable, arguments)
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError  = true,
+                    UseShellExecute        = false,
+                    CreateNoWindow         = true,
+                }
+            };
+            proc.Start();
+            var output = await proc.StandardOutput.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            return output;
+        }
+        catch
+        {
+            return string.Empty;
         }
     }
 
@@ -806,15 +998,34 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
             sout.WriteLine("             Mac/Linux: /etc/hosts");
             sout.WriteLine("             Format  : <ip>  <hostname>");
         }
+        else if (Has("Firewall:Outbound", false))
+        {
+            sout.WriteLine($"  [WARN] Windows Firewall on THIS machine is blocking outbound TCP to port {port}.");
+            sout.WriteLine($"         This is the most likely cause of the TCP timeout.");
+            sout.WriteLine($"         → Run as administrator on THIS machine:");
+            sout.WriteLine($"             netsh advfirewall firewall add rule ^");
+            sout.WriteLine($"               name=\"AskUI Client\" dir=out action=allow protocol=TCP remoteport={port}");
+            sout.WriteLine($"         → Or check the current outbound default policy:");
+            sout.WriteLine($"             netsh advfirewall show allprofiles | findstr \"Policy\"");
+        }
+        else if (Has("Firewall:Inbound", false) && !Has("TCP", false))
+        {
+            sout.WriteLine($"  [WARN] Windows Firewall on THIS machine is blocking inbound TCP port {port}.");
+            sout.WriteLine($"         This matters only if this machine is the AskUI Controller.");
+            sout.WriteLine($"         → Run as administrator on THIS machine:");
+            sout.WriteLine($"             netsh advfirewall firewall add rule ^");
+            sout.WriteLine($"               name=\"AskUI Controller\" dir=in action=allow protocol=TCP localport={port}");
+        }
         else if (Has("TCP", false) && Has("gRPC (no proxy)", false))
         {
             sout.WriteLine($"  [WARN] TCP connection failed — port {port} is not reachable.");
-            sout.WriteLine($"         → On the TARGET machine, check that the controller is running:");
+            sout.WriteLine($"         → On the TARGET machine, verify the service is listening:");
             sout.WriteLine($"             netstat -ano | findstr :{port}");
             sout.WriteLine($"           You need 0.0.0.0:{port} — if 127.0.0.1:{port}, it only accepts local connections.");
-            sout.WriteLine($"         → Open Windows Firewall on the TARGET machine (run as administrator):");
+            sout.WriteLine($"         → Check Windows Firewall inbound rules on the TARGET machine (run as administrator):");
             sout.WriteLine($"             netsh advfirewall firewall add rule ^");
             sout.WriteLine($"               name=\"AskUI Controller\" dir=in action=allow protocol=TCP localport={port}");
+            sout.WriteLine($"         → Check for a network-level firewall between the two machines (different subnets/VLANs).");
         }
         else if (Has("TCP", true) && Has("gRPC (no proxy)", false))
         {
