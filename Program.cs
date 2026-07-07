@@ -397,12 +397,10 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
     {
         log.Info("Checking whether port 26000 is listening locally on this machine...");
 
-        // Use the TCP listener table — faster and more reliable than a connect.
-        bool listening;
+        IPEndPoint[] listeners;
         try
         {
-            var listeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners();
-            listening = listeners.Any(ep => ep.Port == 26000);
+            listeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners();
         }
         catch
         {
@@ -411,22 +409,49 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
             try
             {
                 await tcp.ConnectAsync("127.0.0.1", 26000).WaitAsync(TimeSpan.FromSeconds(2));
-                listening = true;
+                Pass("Local Service", "port 26000 is open locally (listener table unavailable — verified via connect)");
             }
-            catch { listening = false; }
+            catch
+            {
+                log.Info("Port 26000 is not listening on this machine.");
+                log.Sub("Expected on the CLIENT machine. If this IS the controller, start the AskUI Core Service.");
+            }
+            return;
         }
 
-        if (listening)
-        {
-            Pass("Local Service", "AskUI Core Service is listening on port 26000 locally");
-        }
-        else
+        var matches = listeners.Where(ep => ep.Port == 26000).ToList();
+
+        if (matches.Count == 0)
         {
             log.Info("Port 26000 is not listening on this machine.");
-            log.Sub("This is expected if the tool is run on the CLIENT machine");
-            log.Sub("(the controller runs on the remote machine, not here).");
-            log.Sub("If this IS the controller machine, start the AskUI Core Service.");
-            // Not recorded as a failure — the client machine is not expected to run the service.
+            log.Sub("Expected on the CLIENT machine. If this IS the controller, start the AskUI Core Service.");
+            return;
+        }
+
+        foreach (var ep in matches)
+        {
+            bool isAny      = ep.Address.Equals(IPAddress.Any) || ep.Address.Equals(IPAddress.IPv6Any);
+            bool isLoopback = IPAddress.IsLoopback(ep.Address);
+
+            if (isLoopback)
+            {
+                Fail("Local Service",
+                    $"AskUI Core Service is bound to {ep.Address}:{ep.Port} — LOOPBACK ONLY");
+                log.Sub("The service is running but only accepts connections from THIS machine.");
+                log.Sub("Remote clients (including the Desktop App on another machine) cannot reach it.");
+                log.Sub("→ Check the AskUI Core Service configuration — the bind address must be 0.0.0.0.");
+            }
+            else if (isAny)
+            {
+                Pass("Local Service",
+                    $"AskUI Core Service is listening on 0.0.0.0:{ep.Port} — accepts remote connections");
+            }
+            else
+            {
+                Pass("Local Service",
+                    $"AskUI Core Service is listening on {ep.Address}:{ep.Port}");
+                log.Sub("Bound to a specific interface. Remote clients on other adapters may not reach it.");
+            }
         }
     }
 
@@ -1205,7 +1230,15 @@ try {{
         bool Has(string prefix, bool passed) =>
             _results.Any(r => r.Name.StartsWith(prefix, StringComparison.Ordinal) && r.Passed == passed);
 
-        if (Has("DNS", false))
+        if (Has("Local Service", false) &&
+            _results.Any(r => r.Name == "Local Service" && r.Note.Contains("LOOPBACK")))
+        {
+            sout.WriteLine($"  [WARN] The AskUI Core Service on THIS machine is bound to 127.0.0.1 (loopback only).");
+            sout.WriteLine($"         Remote clients cannot connect to it — only processes on this same machine can.");
+            sout.WriteLine($"         → Check the AskUI Core Service configuration and set the bind address to 0.0.0.0.");
+            sout.WriteLine($"         → Restart the service after changing the configuration.");
+        }
+        else if (Has("DNS", false))
         {
             sout.WriteLine("  [WARN] DNS resolution failed — hostname cannot be translated to an IP.");
             sout.WriteLine("         → Run on the TARGET machine:   ipconfig /all");
