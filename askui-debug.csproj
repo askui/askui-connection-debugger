@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>askui-debug</AssemblyName>
+    <RootNamespace>AskUIDebug</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <!--
+    Self-contained single-file publish properties.
+    These are the defaults used by `make build-*`.
+    Override on the CLI if needed:
+      dotnet publish -r win-x64 -p:PublishTrimmed=false
+  -->
+  <PropertyGroup>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimmerRootDescriptor>trimmer-roots.xml</TrimmerRootDescriptor>
+  </PropertyGroup>
+</Project>

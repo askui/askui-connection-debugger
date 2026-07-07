@@ -1,0 +1,79 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - rid: win-x64
+            output: askui-debug-windows-x64.exe
+          - rid: win-arm64
+            output: askui-debug-windows-arm64.exe
+          - rid: osx-arm64
+            output: askui-debug-darwin-arm64
+          - rid: osx-x64
+            output: askui-debug-darwin-x64
+          - rid: linux-x64
+            output: askui-debug-linux-x64
+          - rid: linux-arm64
+            output: askui-debug-linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish (${{ matrix.rid }})
+        run: |
+          dotnet publish -c Release \
+            -r ${{ matrix.rid }} \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=true \
+            --self-contained true \
+            -o out/${{ matrix.rid }}
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          if [[ "${{ matrix.rid }}" == win-* ]]; then
+            mv "out/${{ matrix.rid }}/askui-debug.exe" "out/${{ matrix.output }}"
+          else
+            mv "out/${{ matrix.rid }}/askui-debug" "out/${{ matrix.output }}"
+            chmod +x "out/${{ matrix.output }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: out/${{ matrix.output }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload release assets
+        run: |
+          for f in artifacts/*; do
+            gh release upload "${{ github.event.release.tag_name }}" "$f" --clobber
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

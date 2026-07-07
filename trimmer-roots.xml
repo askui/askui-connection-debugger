@@ -1,0 +1,8 @@
+<linker>
+  <!-- Keep all System.Net types — trimmer aggressively removes unused socket paths -->
+  <assembly fullname="System.Net.Sockets" preserve="all" />
+  <assembly fullname="System.Net.NameResolution" preserve="all" />
+  <assembly fullname="System.Net.Http" preserve="all" />
+  <assembly fullname="System.Net.NetworkInformation" preserve="all" />
+  <assembly fullname="System.Net.Primitives" preserve="all" />
+</linker>
