@@ -1231,8 +1231,13 @@ try {{
             _results.Any(r => r.Name.StartsWith(prefix, StringComparison.Ordinal) && r.Passed == passed);
 
         if (Has("Local Service", false) &&
-            _results.Any(r => r.Name == "Local Service" && r.Note.Contains("LOOPBACK")))
+            _results.Any(r => r.Name == "Local Service" && r.Note.Contains("LOOPBACK")) &&
+            !Has("TCP", false))
         {
+            // Only surface loopback binding as the primary diagnosis when we can actually
+            // reach the remote target (TCP passes). If TCP to the remote host is also failing,
+            // the loopback binding is irrelevant to the connection problem — this machine is
+            // acting as a client, not as the controller being connected to.
             sout.WriteLine($"  [WARN] The AskUI Core Service on THIS machine is bound to 127.0.0.1 (loopback only).");
             sout.WriteLine($"         Remote clients cannot connect to it — only processes on this same machine can.");
             sout.WriteLine($"         → Check the AskUI Core Service configuration and set the bind address to 0.0.0.0.");
@@ -1356,9 +1361,11 @@ try {{
     private static bool IsStreamLevelError(Exception ex)
     {
         var msg = (ex.InnerException ?? ex).Message;
+        // Note: "CANCEL" is intentionally NOT matched here — "A task was canceled" from
+        // HttpClient.Timeout contains "canceled" and would be a false positive. Real HTTP/2
+        // CANCEL resets always come paired with "RST_STREAM" in .NET's error messages.
         return msg.Contains("RST_STREAM",        StringComparison.OrdinalIgnoreCase)
             || msg.Contains("GOAWAY",            StringComparison.OrdinalIgnoreCase)
-            || msg.Contains("CANCEL",            StringComparison.OrdinalIgnoreCase)
             || msg.Contains("prematurely",       StringComparison.OrdinalIgnoreCase)
             || msg.Contains("invalid data",      StringComparison.OrdinalIgnoreCase)
             || msg.Contains("unrecognized resp", StringComparison.OrdinalIgnoreCase)
@@ -1368,6 +1375,11 @@ try {{
 
     private static string CategorizeGrpcException(Exception ex)
     {
+        // Check for timeout FIRST — TaskCanceledException from HttpClient.Timeout must not
+        // fall through to IsStreamLevelError, which would misreport it as a stream reset.
+        if (ex is TaskCanceledException || ex.InnerException is TaskCanceledException
+            || ex.InnerException is TimeoutException)
+            return "timeout — connection timed out (firewall or network-level block)";
         var msg = (ex.InnerException ?? ex).Message;
         if (IsStreamLevelError(ex))        return $"HTTP/2 stream reset by server ({msg})";
         if (msg.Contains("refused",        StringComparison.OrdinalIgnoreCase)) return "connection refused";
