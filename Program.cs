@@ -86,7 +86,7 @@ host = host.TrimStart()
            .Replace("http://",  "", StringComparison.OrdinalIgnoreCase)
            .TrimEnd('/');
 
-// Handle host:port shorthand (e.g. "10.150.122.214:26000")
+// Handle host:port shorthand (e.g. "192.168.1.100:26000")
 if (!host.StartsWith('[') && host.Contains(':'))
 {
     var lastColon = host.LastIndexOf(':');
@@ -167,9 +167,9 @@ static void PrintUsage() => Console.Error.WriteLine("""
       --help, -h          Show this help
 
     Examples:
-      askui-debug Winmod-TS4
-      askui-debug --port 6769 10.150.122.214
-      askui-debug --verbose --no-color 10.150.122.214
+      askui-debug controller-host
+      askui-debug --port 26000 192.168.1.100
+      askui-debug --verbose --no-color 192.168.1.100
     """);
 
 
@@ -336,6 +336,9 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
         await RunAsync("Local AskUI Service",        CheckLocalServiceAsync);
         await RunAsync("Local Network Interfaces",   () => { CheckLocalInterfaces(); return Task.CompletedTask; });
         await RunAsync("DNS / Name Resolution",      CheckDnsAsync);
+        await RunAsync("Route / Subnet Analysis",    () => { CheckRouting();         return Task.CompletedTask; });
+        await RunAsync("ARP Cache",                  CheckArpAsync);
+        await RunAsync("ICMP Ping",                  CheckIcmpAsync);
         await RunAsync("Proxy Configuration",        () => { CheckProxy();           return Task.CompletedTask; });
         await RunAsync("Windows Firewall Rules",     CheckFirewallAsync);
         await RunAsync("TCP Connectivity",           CheckTcpAsync);
@@ -516,6 +519,220 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
             log.Sub("→ Try the IP address directly instead of the hostname.");
             log.Sub("→ On the target machine, run `ipconfig /all` to find its real IP.");
             log.Debug("Full exception: {0}", ex);
+        }
+    }
+
+    // ── Check: Route / Subnet Analysis (Layer 3) ──────────────────────────────
+    //
+    // Determines whether the target IP is on the same subnet as a local interface
+    // (direct Layer-2 path) or must be routed through a gateway (cross-subnet /
+    // inter-VLAN). A cross-subnet path means a router or ACL firewall sits
+    // between the machines — a common cause of silent TCP timeouts.
+
+    private void CheckRouting()
+    {
+        var targets = _resolvedIPs.Count > 0 ? _resolvedIPs : [host];
+
+        foreach (var ipStr in targets)
+        {
+            if (!IPAddress.TryParse(ipStr, out var targetIp) ||
+                targetIp.AddressFamily != AddressFamily.InterNetwork)
+            {
+                log.Info("Route analysis skipped for {0} (not an IPv4 address).", ipStr);
+                continue;
+            }
+
+            string?    matchIface   = null;
+            IPAddress? matchLocalIp = null;
+            IPAddress? matchMask    = null;
+
+            foreach (var iface in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (iface.OperationalStatus != OperationalStatus.Up) continue;
+                if (iface.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                foreach (var unicast in iface.GetIPProperties().UnicastAddresses)
+                {
+                    if (unicast.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                    if (IsApipa(unicast.Address)) continue;
+                    var mask = unicast.IPv4Mask;
+                    if (mask is null) continue;
+                    if (IsInSameSubnet(targetIp, unicast.Address, mask))
+                    {
+                        matchIface   = iface.Name;
+                        matchLocalIp = unicast.Address;
+                        matchMask    = mask;
+                        break;
+                    }
+                }
+                if (matchIface is not null) break;
+            }
+
+            if (matchIface is not null)
+            {
+                Pass($"Route:{ipStr}", $"same subnet as {matchLocalIp}/{MaskToCidr(matchMask!)} via {matchIface}");
+                log.Sub("Traffic takes a direct Layer-2 path — no router between the two machines.");
+            }
+            else
+            {
+                log.Warn("{0} is on a different subnet — traffic will be routed through a gateway.", ipStr);
+                log.Sub("A router or inter-VLAN firewall sits between this machine and the target.");
+                log.Sub("If TCP times out, a network-level ACL between subnets may be dropping packets.");
+
+                var gateways = new List<string>();
+                foreach (var iface in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (iface.OperationalStatus != OperationalStatus.Up) continue;
+                    foreach (var gw in iface.GetIPProperties().GatewayAddresses)
+                        if (gw.Address.AddressFamily == AddressFamily.InterNetwork)
+                            gateways.Add($"{gw.Address} (via {iface.Name})");
+                }
+                if (gateways.Count > 0)
+                    log.Sub("Default gateway(s): {0}", string.Join(", ", gateways));
+
+                _results.Add(new($"Route:{ipStr}", false,
+                    "different subnet — routed through gateway (inter-VLAN firewall possible)"));
+            }
+        }
+    }
+
+    private static bool IsInSameSubnet(IPAddress a, IPAddress b, IPAddress mask)
+    {
+        var ab = a.GetAddressBytes();
+        var bb = b.GetAddressBytes();
+        var mb = mask.GetAddressBytes();
+        for (int i = 0; i < 4; i++)
+            if ((ab[i] & mb[i]) != (bb[i] & mb[i])) return false;
+        return true;
+    }
+
+    private static int MaskToCidr(IPAddress mask)
+    {
+        var bits = mask.GetAddressBytes();
+        return bits.Sum(b => System.Numerics.BitOperations.PopCount(b));
+    }
+
+    // ── Check: ARP Cache (Layer 2) ────────────────────────────────────────────
+    //
+    // Looks up the target IP in the local ARP table. A hit confirms the host has
+    // been seen at Layer 2 (same broadcast domain) recently. A miss is expected
+    // when the target is on a different subnet or on first contact — not a failure.
+
+    private async Task CheckArpAsync()
+    {
+        var targets = _resolvedIPs.Count > 0 ? _resolvedIPs : [host];
+        foreach (var ip in targets)
+        {
+            log.Info("Checking ARP cache for {0}...", ip);
+            var arpArgs = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? $"-a {ip}" : $"-n {ip}";
+            var output  = await RunCommandAsync("arp", arpArgs);
+            log.Debug("arp output:{0}{1}", Environment.NewLine, output);
+
+            var mac = ParseArpMac(output, ip);
+            if (mac is not null)
+            {
+                Pass($"ARP:{ip}", $"{ip} → {mac}  (host has Layer-2 visibility)");
+            }
+            else
+            {
+                log.Info("{0} not in ARP cache.", ip);
+                log.Sub("Expected if the target is on a different subnet (traffic goes via gateway).");
+                log.Sub("Expected on first connection attempt or after ARP cache expiry.");
+            }
+        }
+    }
+
+    private static string? ParseArpMac(string output, string ip)
+    {
+        foreach (var line in output.Split('\n'))
+        {
+            if (!line.Contains(ip)) continue;
+            if (line.Contains("no entry",       StringComparison.OrdinalIgnoreCase)) return null;
+            if (line.Contains("No ARP Entries", StringComparison.OrdinalIgnoreCase)) return null;
+            var parts = line.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries);
+            foreach (var p in parts)
+            {
+                if (p.Length < 17) continue;
+                var norm     = p.Replace(':', '-').ToLowerInvariant();
+                var segments = norm.Split('-');
+                if (segments.Length == 6 &&
+                    segments.All(s => s.Length == 2 && s.All(c => "0123456789abcdef".Contains(c))))
+                    return p;
+            }
+        }
+        return null;
+    }
+
+    // ── Check: ICMP Ping (Layer 3) ────────────────────────────────────────────
+    //
+    // Sends 4 ICMP echo probes. A response proves IP-level reachability even if
+    // the TCP port is firewalled. No response does NOT prove the host is down —
+    // Windows Firewall blocks ICMP by default.
+    //
+    // Cross-correlate with TCP:
+    //   ICMP pass + TCP fail → host alive, block is at Layer 4 (port / firewall)
+    //   ICMP fail + TCP fail → host unreachable at network level, or ICMP blocked
+    //   ICMP pass + TCP pass → all good
+
+    private async Task CheckIcmpAsync()
+    {
+        var targets = _resolvedIPs.Count > 0 ? _resolvedIPs : [host];
+        using var ping = new Ping();
+
+        foreach (var ip in targets)
+        {
+            log.Info("Sending 4 ICMP echo probes to {0}...", ip);
+
+            var latencies   = new List<long>();
+            int receivedTtl = 0;
+            var failures    = new List<string>();
+
+            for (int i = 0; i < 4; i++)
+            {
+                try
+                {
+                    var reply = await ping.SendPingAsync(ip, 3000);
+                    if (reply.Status == IPStatus.Success)
+                    {
+                        latencies.Add(reply.RoundtripTime);
+                        receivedTtl = reply.Options?.Ttl ?? receivedTtl;
+                    }
+                    else
+                    {
+                        failures.Add(reply.Status.ToString());
+                        log.Debug("ICMP probe {0}: {1}", i + 1, reply.Status);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    failures.Add(ex.Message);
+                    log.Debug("ICMP probe {0} exception: {1}", i + 1, ex.Message);
+                }
+            }
+
+            if (latencies.Count > 0)
+            {
+                var avg = (long)latencies.Average();
+                var min = latencies.Min();
+                var max = latencies.Max();
+                Pass($"ICMP:{ip}", $"responds to ping — avg {avg}ms (min {min} / max {max}), TTL={receivedTtl}");
+
+                if (receivedTtl > 0)
+                {
+                    int initialTtl = receivedTtl <= 64 ? 64 : receivedTtl <= 128 ? 128 : 255;
+                    int hops       = initialTtl - receivedTtl;
+                    if (hops > 0)
+                        log.Sub("~{0} hop(s) to target (received TTL {1}, estimated initial TTL {2})", hops, receivedTtl, initialTtl);
+                }
+            }
+            else
+            {
+                var reason = failures.Count > 0 ? failures[0] : "all probes timed out";
+                log.Warn("No ICMP response from {0}: {1}", ip, reason);
+                log.Sub("Windows Firewall blocks ICMP by default — a non-response is NOT proof the host is down.");
+                log.Sub("Cross-reference with TCP: both timeout → likely a network-level block.");
+                _results.Add(new($"ICMP:{ip}", false,
+                    $"no ICMP response ({reason}) — may be firewall-blocked, not necessarily unreachable"));
+            }
         }
     }
 
@@ -1016,16 +1233,50 @@ try {{
             sout.WriteLine($"             netsh advfirewall firewall add rule ^");
             sout.WriteLine($"               name=\"AskUI Controller\" dir=in action=allow protocol=TCP localport={port}");
         }
+        else if (Has("Route", false) && Has("TCP", false) && !Has("Firewall:Outbound", false))
+        {
+            sout.WriteLine($"  [WARN] The target is on a different subnet and TCP port {port} is unreachable.");
+            sout.WriteLine($"         A network-level firewall (inter-VLAN ACL or router firewall) is likely");
+            sout.WriteLine($"         blocking TCP traffic between the two subnets.");
+            sout.WriteLine($"         → Ask your network administrator to allow TCP port {port} between the two subnets.");
+            sout.WriteLine($"         → Also verify on the TARGET machine that the service is listening:");
+            sout.WriteLine($"             netstat -ano | findstr :{port}");
+        }
         else if (Has("TCP", false) && Has("gRPC (no proxy)", false))
         {
-            sout.WriteLine($"  [WARN] TCP connection failed — port {port} is not reachable.");
-            sout.WriteLine($"         → On the TARGET machine, verify the service is listening:");
-            sout.WriteLine($"             netstat -ano | findstr :{port}");
-            sout.WriteLine($"           You need 0.0.0.0:{port} — if 127.0.0.1:{port}, it only accepts local connections.");
-            sout.WriteLine($"         → Check Windows Firewall inbound rules on the TARGET machine (run as administrator):");
-            sout.WriteLine($"             netsh advfirewall firewall add rule ^");
-            sout.WriteLine($"               name=\"AskUI Controller\" dir=in action=allow protocol=TCP localport={port}");
-            sout.WriteLine($"         → Check for a network-level firewall between the two machines (different subnets/VLANs).");
+            var icmpPassed = _results.Any(r => r.Name.StartsWith("ICMP:", StringComparison.Ordinal) && r.Passed);
+            var icmpFailed = _results.Any(r => r.Name.StartsWith("ICMP:", StringComparison.Ordinal) && !r.Passed);
+
+            sout.WriteLine($"  [WARN] TCP connection to port {port} failed.");
+            if (icmpPassed)
+            {
+                sout.WriteLine($"         ICMP ping succeeded — the host is alive at the network level.");
+                sout.WriteLine($"         The block is at Layer 4 (TCP/port level), not the network.");
+                sout.WriteLine($"         → Check Windows Firewall inbound rules on the TARGET machine (run as administrator):");
+                sout.WriteLine($"             netsh advfirewall firewall add rule ^");
+                sout.WriteLine($"               name=\"AskUI Controller\" dir=in action=allow protocol=TCP localport={port}");
+                sout.WriteLine($"         → Verify the service is listening on the TARGET machine:");
+                sout.WriteLine($"             netstat -ano | findstr :{port}");
+                sout.WriteLine($"           You need 0.0.0.0:{port} — if 127.0.0.1:{port}, it only accepts local connections.");
+            }
+            else if (icmpFailed)
+            {
+                sout.WriteLine($"         ICMP ping also failed — host may be unreachable at the network level.");
+                sout.WriteLine($"         → Check network routing: are the two machines in the same VLAN / subnet?");
+                sout.WriteLine($"         → A router ACL or inter-VLAN firewall may be blocking all traffic.");
+                sout.WriteLine($"         → Verify on the TARGET machine that the service is listening:");
+                sout.WriteLine($"             netstat -ano | findstr :{port}");
+            }
+            else
+            {
+                sout.WriteLine($"         → On the TARGET machine, verify the service is listening:");
+                sout.WriteLine($"             netstat -ano | findstr :{port}");
+                sout.WriteLine($"           You need 0.0.0.0:{port} — if 127.0.0.1:{port}, it only accepts local connections.");
+                sout.WriteLine($"         → Check Windows Firewall inbound rules on the TARGET machine (run as administrator):");
+                sout.WriteLine($"             netsh advfirewall firewall add rule ^");
+                sout.WriteLine($"               name=\"AskUI Controller\" dir=in action=allow protocol=TCP localport={port}");
+                sout.WriteLine($"         → Check for a network-level firewall between the two machines (different subnets/VLANs).");
+            }
         }
         else if (Has("TCP", true) && Has("gRPC (no proxy)", false))
         {
