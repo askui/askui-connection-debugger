@@ -325,8 +325,9 @@ record FirewallRule(string Name, string Action, string Profiles);
 
 class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, string host, int port)
 {
-    private readonly List<CheckResult> _results    = [];
-    private readonly List<string>      _resolvedIPs = [];
+    private readonly List<CheckResult> _results      = [];
+    private readonly List<string>      _resolvedIPs  = [];
+    private readonly List<string>      _resolvedIPv6s = [];
 
     private string TargetUrl => $"http://{host}:{port}";
 
@@ -337,6 +338,7 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
         await RunAsync("Local Network Interfaces",   () => { CheckLocalInterfaces(); return Task.CompletedTask; });
         await RunAsync("DNS / Name Resolution",      CheckDnsAsync);
         await RunAsync("Route / Subnet Analysis",    () => { CheckRouting();         return Task.CompletedTask; });
+        await RunAsync("OS Routing Table",           CheckRoutingTableAsync);
         await RunAsync("ARP Cache",                  CheckArpAsync);
         await RunAsync("ICMP Ping",                  CheckIcmpAsync);
         await RunAsync("Proxy Configuration",        () => { CheckProxy();           return Task.CompletedTask; });
@@ -490,11 +492,20 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
 
     private async Task CheckDnsAsync()
     {
-        if (IPAddress.TryParse(host, out _))
+        if (IPAddress.TryParse(host, out var rawIp))
         {
-            log.Info("Host is a raw IP address — DNS resolution skipped");
-            _resolvedIPs.Add(host);
-            _results.Add(new("DNS", true, "raw IP, no resolution needed"));
+            if (rawIp.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                log.Info("Host is a raw IPv6 address — DNS resolution skipped");
+                _resolvedIPv6s.Add(host);
+                _results.Add(new("DNS", true, "raw IPv6 address, no resolution needed"));
+            }
+            else
+            {
+                log.Info("Host is a raw IPv4 address — DNS resolution skipped");
+                _resolvedIPs.Add(host);
+                _results.Add(new("DNS", true, "raw IPv4 address, no resolution needed"));
+            }
             return;
         }
 
@@ -507,14 +518,19 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
             var addresses = await Dns.GetHostAddressesAsync(host).WaitAsync(TimeSpan.FromSeconds(5));
             sw.Stop();
 
-            log.Pass("Resolved {0} address(es) for \"{1}\" in {2}ms:", addresses.Length, host, sw.ElapsedMilliseconds);
+            var v4Count = addresses.Count(a => a.AddressFamily == AddressFamily.InterNetwork);
+            var v6Count = addresses.Count(a => a.AddressFamily == AddressFamily.InterNetworkV6);
+            log.Pass("Resolved {0} address(es) for \"{1}\" in {2}ms ({3} IPv4/A, {4} IPv6/AAAA):",
+                addresses.Length, host, sw.ElapsedMilliseconds, v4Count, v6Count);
 
             bool anyUsable = false;
             foreach (var addr in addresses)
             {
                 if (addr.AddressFamily == AddressFamily.InterNetworkV6)
                 {
-                    log.Debug("  {0} (IPv6 — skipping primary display)", addr);
+                    log.Sub("  {0} (IPv6/AAAA)", addr);
+                    _resolvedIPv6s.Add(addr.ToString());
+                    anyUsable = true;
                     continue;
                 }
                 if (IsApipa(addr))
@@ -536,7 +552,10 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
                 Fail("DNS", "all resolved IPs are APIPA (169.254.x.x) — unreachable over the network");
                 return;
             }
-            _results.Add(new("DNS", true, $"resolved to {string.Join(", ", _resolvedIPs)}"));
+            var dnsParts = new List<string>();
+            if (_resolvedIPs.Count > 0)    dnsParts.Add(string.Join(", ", _resolvedIPs));
+            if (_resolvedIPv6s.Count > 0)  dnsParts.Add($"{_resolvedIPv6s.Count} IPv6");
+            _results.Add(new("DNS", true, $"resolved: {string.Join(" | ", dnsParts)}"));
         }
         catch (Exception ex)
         {
@@ -634,6 +653,172 @@ class Checker(Logger log, TerminalProgress progress, TextWriter summaryOut, stri
     {
         var bits = mask.GetAddressBytes();
         return bits.Sum(b => System.Numerics.BitOperations.PopCount(b));
+    }
+
+    // ── Check: OS Routing Table (IPv4 + IPv6) ─────────────────────────────────
+    //
+    // Reads the OS routing table for both address families and shows the default
+    // gateway(s). Then performs a specific route lookup for every resolved target
+    // IP so the operator can see exactly what path packets will take.
+
+    private async Task CheckRoutingTableAsync()
+    {
+        bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        bool isMac     = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+
+        log.Info("Reading OS routing table (IPv4 + IPv6)...");
+
+        if (isWindows)
+        {
+            var v4Table = await RunCommandAsync("route", "print -4");
+            log.Debug("route print -4:{0}{1}", Environment.NewLine, v4Table);
+            ShowWindowsDefaultRoutes(v4Table, "IPv4");
+
+            var v6Table = await RunCommandAsync("route", "print -6");
+            log.Debug("route print -6:{0}{1}", Environment.NewLine, v6Table);
+            ShowWindowsDefaultRoutes(v6Table, "IPv6");
+        }
+        else if (isMac)
+        {
+            var v4Table = await RunCommandAsync("netstat", "-rn -f inet");
+            log.Debug("netstat -rn -f inet:{0}{1}", Environment.NewLine, v4Table);
+            ShowUnixDefaultRoutes(v4Table, "IPv4");
+
+            var v6Table = await RunCommandAsync("netstat", "-rn -f inet6");
+            log.Debug("netstat -rn -f inet6:{0}{1}", Environment.NewLine, v6Table);
+            ShowUnixDefaultRoutes(v6Table, "IPv6");
+        }
+        else // Linux
+        {
+            var v4Table = await RunCommandAsync("ip", "route show");
+            log.Debug("ip route show:{0}{1}", Environment.NewLine, v4Table);
+            ShowLinuxDefaultRoutes(v4Table, "IPv4");
+
+            var v6Table = await RunCommandAsync("ip", "-6 route show");
+            log.Debug("ip -6 route show:{0}{1}", Environment.NewLine, v6Table);
+            ShowLinuxDefaultRoutes(v6Table, "IPv6");
+        }
+
+        // Specific route lookup for each resolved target IP
+        IEnumerable<string> ipv4Targets = _resolvedIPs.Count > 0
+            ? _resolvedIPs
+            : (IPAddress.TryParse(host, out var ph) && ph.AddressFamily == AddressFamily.InterNetwork
+                ? (IEnumerable<string>)[host]
+                : []);
+
+        foreach (var ip in ipv4Targets)
+            await ShowSpecificRouteAsync(ip, isIPv6: false, isWindows, isMac);
+
+        foreach (var ip in _resolvedIPv6s)
+            await ShowSpecificRouteAsync(ip, isIPv6: true, isWindows, isMac);
+
+        _results.Add(new("Routing Table", true, "OS routing table read (informational)"));
+    }
+
+    private void ShowWindowsDefaultRoutes(string routeOutput, string family)
+    {
+        bool inActive = false;
+        int shown = 0;
+        foreach (var raw in routeOutput.Split('\n'))
+        {
+            var line = raw.TrimEnd();
+            if (line.TrimStart().StartsWith("Active Routes:", StringComparison.OrdinalIgnoreCase))
+            {
+                inActive = true;
+                continue;
+            }
+            if (!inActive) continue;
+            if (line.Contains("=====") ||
+                line.TrimStart().StartsWith("Persistent Routes:", StringComparison.OrdinalIgnoreCase))
+                break;
+
+            var t = line.Trim();
+            if (string.IsNullOrEmpty(t)) continue;
+            if (t.StartsWith("Network Destination", StringComparison.OrdinalIgnoreCase)) continue;
+
+            bool isDefault = family == "IPv4"
+                ? t.StartsWith("0.0.0.0")
+                : t.StartsWith("::/0") || t.StartsWith("::0/0");
+            if (isDefault) { log.Sub("{0} default route: {1}", family, t); shown++; }
+        }
+        if (shown == 0) log.Info("{0}: no default route found in routing table.", family);
+    }
+
+    private void ShowUnixDefaultRoutes(string netstatOutput, string family)
+    {
+        int shown = 0;
+        foreach (var raw in netstatOutput.Split('\n'))
+        {
+            var t = raw.Trim();
+            if (t.StartsWith("default", StringComparison.OrdinalIgnoreCase))
+            {
+                log.Sub("{0} default route: {1}", family, t);
+                shown++;
+            }
+        }
+        if (shown == 0) log.Info("{0}: no default route found.", family);
+    }
+
+    private void ShowLinuxDefaultRoutes(string ipRouteOutput, string family)
+    {
+        int shown = 0;
+        foreach (var raw in ipRouteOutput.Split('\n'))
+        {
+            var t = raw.Trim();
+            if (t.StartsWith("default ", StringComparison.OrdinalIgnoreCase))
+            {
+                log.Sub("{0} default route: {1}", family, t);
+                shown++;
+            }
+        }
+        if (shown == 0) log.Info("{0}: no default route found.", family);
+    }
+
+    private async Task ShowSpecificRouteAsync(string ip, bool isIPv6, bool isWindows, bool isMac)
+    {
+        log.Info("Route lookup for {0} ({1}):", ip, isIPv6 ? "IPv6" : "IPv4");
+        string output;
+
+        if (isWindows)
+        {
+            var script = $@"$ErrorActionPreference='SilentlyContinue'
+try {{
+    $r=Find-NetRoute -RemoteIPAddress '{ip}' 2>$null | Select-Object -First 1
+    if($r){{""Prefix=$($r.DestinationPrefix) NextHop=$($r.NextHop) Interface=$($r.InterfaceAlias) Metric=$($r.RouteMetric)""}}
+}} catch {{}}";
+            var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+            output = await RunCommandAsync("powershell", $"-NoProfile -NonInteractive -EncodedCommand {encoded}");
+        }
+        else if (isMac)
+        {
+            output = isIPv6
+                ? await RunCommandAsync("route", $"-n get -inet6 {ip}")
+                : await RunCommandAsync("route", $"-n get {ip}");
+        }
+        else
+        {
+            output = isIPv6
+                ? await RunCommandAsync("ip", $"-6 route get {ip}")
+                : await RunCommandAsync("ip", $"route get {ip}");
+        }
+
+        log.Debug("Route lookup output:{0}{1}", Environment.NewLine, output);
+
+        if (string.IsNullOrWhiteSpace(output))
+        {
+            if (isIPv6)
+                log.Info("No IPv6 route for {0} — this machine may have no IPv6 connectivity.", ip);
+            else
+                log.Warn("No route found for {0} — host may be unreachable.", ip);
+            return;
+        }
+
+        foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Take(10))
+        {
+            var t = line.TrimEnd();
+            if (!string.IsNullOrEmpty(t.Trim()))
+                log.Sub("  {0}", t.TrimStart());
+        }
     }
 
     // ── Check: ARP Cache (Layer 2) ────────────────────────────────────────────
@@ -1014,6 +1199,26 @@ try {{
                 sw.Stop();
                 var reason = CategorizeTcpError(ex);
                 Fail($"TCP:{ip}", $"{ip}:{port} — {reason}");
+                log.Debug("Raw error: {0}", ex.Message);
+            }
+        }
+
+        foreach (var ip in _resolvedIPv6s)
+        {
+            log.Info("Dialing TCP [{0}]:{1} (timeout 5s, IPv6)...", ip, port);
+            using var tcp6 = new TcpClient(AddressFamily.InterNetworkV6);
+            var sw6 = Stopwatch.StartNew();
+            try
+            {
+                await tcp6.ConnectAsync(ip, port).WaitAsync(TimeSpan.FromSeconds(5));
+                sw6.Stop();
+                Pass($"TCP(v6):[{ip}]", $"[{ip}]:{port} connected in {sw6.ElapsedMilliseconds}ms (IPv6)");
+            }
+            catch (Exception ex)
+            {
+                sw6.Stop();
+                var reason = CategorizeTcpError(ex);
+                Fail($"TCP(v6):[{ip}]", $"[{ip}]:{port} — {reason} (IPv6)");
                 log.Debug("Raw error: {0}", ex.Message);
             }
         }
